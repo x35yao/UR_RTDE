@@ -20,325 +20,491 @@ import ctypes
 import pickle
 import cv2
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir))
-from glob import glob
+import shutil
 import yaml
 from scipy.spatial.transform import Rotation as R
-from assembly import normalize_wrapper, create_tags, homogeneous_transform, get_obj_pose, analyze_images, analyze_videos, TFEncoderDecoder2, process_quaternions
+from assembly import TFEncoderDecoder4, create_tags, get_obj_pose, homogeneous_transform, svo_to_avi, quat_to_rotvect, rotvect_to_quat, normalize_wrapper, inverse_homogeneous_transform, vec2homo, homo2vec
 import pandas as pd
 import torch
 from matplotlib import pyplot as plt
 from control_robot import servoL
-from process_data.main import svo_to_avi
+import urllib
+import subprocess
 
-def is_capslock_on():
-    return True if ctypes.WinDLL("User32.dll").GetKeyState(0x14) else False
+class Robot():
+    def __init__(self, host, frequency):
+        self.host = host
+        self.frequency = frequency
+        self.dt = 1/frequency
 
-
-calibration_matrix = np.array([[-0.07071, 0.00779, 0.08539, -3.77588, -0.08876, 3.81759],
-                               [-0.14419,   4.32640,   0.02626,  -2.17358,   0.14086,  -2.21257 ],
-                               [6.18920,  -0.15334,   6.57294,  -0.27184,   6.62477,  -0.25805],
-                               [-0.00169,   0.05222,  -0.18994,  -0.01967,   0.19266, -0.03254],
-                               [0.20699,  -0.00403,  -0.11136,   0.04967,  -0.10984,  -0.04233],
-                               [0.00134,  -0.11867,   0.00232,  -0.11984,   0.00672,  -0.12104]])
-
-def read_force(filename):
-    '''
-    This file record the gauge values of the force sensor. Force_torque = calibration_matrix @ gauge_values
-    '''
-    global collecting_data
-    gauge_values = []
-
-    with nidaqmx.Task() as task:
-        task.ai_channels.add_ai_voltage_chan("dev1/ai0:5")
-        while collecting_data:
-                gauge_values.append(np.array(task.read(number_of_samples_per_channel=1)).flatten())
-    force_torque = (calibration_matrix @ np.array(gauge_values).T).T
-    np.save(filename + '.npy', force_torque)
-
-def connect_robot(host, FREQUENCY):
-    try:
-        rtde_r = rtde_receive.RTDEReceiveInterface(host, FREQUENCY)
-        rtde_c = rtde_control.RTDEControlInterface(host, FREQUENCY, RTDEControl.FLAG_CUSTOM_SCRIPT)
-        rtde = rtde_io.RTDEIOInterface(host)
-        print("Robot connection success")
-        return rtde, rtde_c, rtde_r
-    except RuntimeError:
-        print('Robot connection failure')
-        raise
-def connect_camera():
-    my_camera = tc.command_camera()
-    if my_camera.connected == 1:
-        print("Camera connection success")
-    else:
-        print("Camera connection failure")
-    return my_camera
-
-def record_wrist_camera(url, filename):
-    global collecting_data
-    wrist_camera = cv2.VideoCapture(url)
-    frame_width = int(wrist_camera.get(3))
-    frame_height = int(wrist_camera.get(4))
-
-    out = cv2.VideoWriter(filename + '.avi', cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'), 10, (frame_width, frame_height))
-    while collecting_data:
-        ret, frame = wrist_camera.read()
-        if ret == True:
-            out.write(frame)
-        else:
-            break
-    wrist_camera.release()
-    out.release()
-
-def connect_wrist_camera(url):
-    wrist_camera = cv2.VideoCapture(url)
-    if not wrist_camera.isOpened():
-       raise ValueError('Wrist camera cannot be connected, check wrist camera opened and url correct')
-    else:
-        print('Wrist camera connection success')
-    return
-
-def get_obj_pose_zed():
-    video_id = str(datetime.datetime.now().timestamp()).split('.')[0]
-    # video_id = '1715130445'
-    video_dir = os.path.join(FOLDER, 'zed_videos', video_id)
-    os.makedirs(video_dir, exist_ok=True)
-    filename = os.path.join(video_dir, video_id)
-    my_camera.start_trial(filename)
-    time.sleep(1)
-    my_camera.stop_trial()
-    ## convert svo to avi files ###
-    svo_to_avi(filename + '.svo', video_dir)
-    vids = glob(os.path.join(video_dir, '*.avi'))
-    ### Analyze videos to get the 3d coordinates of markers
-    analyze_videos(vids, task_config)
-    ## Get object pose ###
-    h5_3d_zed = os.path.join(video_dir, '3d_combined', 'markers_trajectory_3d.h5')
-    df_pose_zed = get_obj_pose(h5_3d_zed, video_dir, zed_in_base, obj_templates_in_base_for_zed,
-                               HT_template_in_base_for_zed, 'zed', window_size=5)
-    print('Get object pose from zed camera.')
-    return df_pose_zed
-
-def get_obj_pose_wrist():
-    current_pose = rtde_r.getActualTCPPose()
-    pos = np.array(current_pose[:3]) * scale
-    rotmatrix = R.from_rotvec(current_pose[3:]).as_matrix()
-    tcp_in_robot = homogeneous_transform(rotmatrix, pos)
-    wrist_camera = cv2.VideoCapture(url)
-    ret, frame_left = wrist_camera.read()
-    move_right(rtde_r, rtde_c, 0.05, 'tool')
-    time.sleep(4)
-    wrist_camera = cv2.VideoCapture(url)
-    ret, frame_right = wrist_camera.read()
-    image_id = str(datetime.datetime.now().timestamp()).split('.')[0]
-    image_dir = os.path.join(FOLDER, demo_dir, 'wrist_images', image_id)
-    os.makedirs(image_dir, exist_ok=True)
-    fname_left = os.path.join(image_dir, image_id + '_left.jpeg')
-    fname_right = os.path.join(image_dir, image_id + '_right.jpeg')
-    cv2.imwrite(fname_left, frame_left)
-    cv2.imwrite(fname_right, frame_right)
-    move_left(rtde_r, rtde_c, 0.05, 'tool')
-    ## Analyze images##
-    analyze_images(image_dir, task_config)
-    ## Get object pose ###
-    wrist_cam_in_base = tcp_in_robot @ wrist_camera_in_tcp
-    h5_3d_wrist = glob(os.path.join(image_dir, '3d_combined', f'*.h5'))[0]
-    df_pose_wrist = get_obj_pose(h5_3d_wrist, image_dir, wrist_cam_in_base, obj_templates_in_base_for_wrist,
-                                 HT_template_in_base_for_wrist, 'wrist', window_size=1)
-    print('Get object pose from wrist camera.')
-    return df_pose_wrist
-
-def update_obj_sequence(df_pose_zed, df_pose_wrist, all_objs, task_dims, obj_tags):
-    obj_pose_seq = []
-    if df_pose_zed is None and df_pose_wrist is None:
-        raise('No video or image is captured.')
-    individuals = list(df_pose_zed.columns)
-    for object_ind in all_objs:
-        individual = [ind for ind in individuals if object_ind in ind][0]
-        obj_pose_zed = df_pose_zed[individual][task_dims].to_numpy()
+    def connect(self):
         try:
-            obj_pose_wrist = df_pose_wrist[individual][task_dims].to_numpy()
-        except (KeyError, TypeError) as error: ### KeyError if this object is not detected. TypeError if df_pose_wrist is None
-            obj_pose_wrist = np.zeros(len(task_dims))
-            obj_pose_wrist[:] = np.nan
-        if not np.isnan(obj_pose_wrist).any():
-            obj_pose = obj_pose_wrist
+            self.rtde_r = rtde_receive.RTDEReceiveInterface(self.host, self.frequency)
+            self.rtde_c = rtde_control.RTDEControlInterface(self.host, self.frequency, RTDEControl.FLAG_CUSTOM_SCRIPT)
+            self.rtde = rtde_io.RTDEIOInterface(self.host)
+            print("Robot connection success")
+        except RuntimeError:
+            print('Robot connection failure')
+
+    # def get_tcp_pose(self):
+    #     return self.rtde_r.getActualTCPPose()
+
+    def get_tcp_pose(self):
+        print('This is for testing purposes, change it back to the function above!!!!!!!!')
+        return np.array([1,2,3,4,5,6])
+
+    def servoL(self, traj):
+        servoL(traj, self.rtde_c, self.dt)
+
+class Zed():
+    def __init__(self, destfolder, videotype = 'avi'):
+        self.destfolder = destfolder
+        self.videotype = videotype
+
+    def connect_camera(self):
+        self.cam = tc.command_camera()
+        if self.cam.connected == 1:
+            print("Camera connection success")
         else:
-            obj_pose = obj_pose_zed
-        obj_pose = np.concatenate([obj_pose, obj_tags[object_ind]])
-        obj_pose_seq.append(obj_pose)
-    return torch.tensor(np.array(obj_pose_seq))
+            print("Camera connection failure, is the server opened?")
+
+    def capture_video(self, destfolder = None, duration = 1):
+        if destfolder is None:
+            destfolder = self.destfolder
+        os.makedirs(destfolder, exist_ok=True)
+        fname = os.path.join(destfolder, 'zed')
+        self.cam.start_trial(fname)
+        time.sleep(duration)
+        self.cam.stop_trial()
+        svo_to_avi(fname + '.svo2', outdir = destfolder)
+
+    def analyze_video(self, destfolder = None, visualize = False):
+        if destfolder is None:
+            destfolder = self.destfolder
+        env_name = r"C:/Users/xyao0/anaconda3/envs/DLC"
+        script_path = "C:/Users/xyao0/Desktop/project/assembly/analyze_videos.py"
+        conda_path = "C:/Users/xyao0/anaconda3/ScripDts/conda.exe"
+        subprocess.run(["conda", "run", "-p", env_name, "python", script_path, destfolder, self.videotype, str(visualize)], shell=True)
+
+    def clear_folder(self, destfolder=None):
+        if destfolder is None:
+            destfolder = self.destfolder
+            # Check if the folder exists
+        if os.path.exists(destfolder) and os.path.isdir(destfolder):
+            for item in os.listdir(destfolder):
+                item_path = os.path.join(destfolder, item)
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.remove(item_path)  # Remove file or symbolic link
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)  # Remove directory
+            print(f"Cleared contents of '{destfolder}'")
+        else:
+            print(f"The folder '{destfolder}' does not exist or is not a directory.")
+
+class Wrist():
+    def __init__(self, destfolder, url_left, url_right, imagetype = 'png'):
+        self.url_left = url_left
+        self.url_right = url_right
+        self.destfolder = destfolder
+        self.imagetype = imagetype
+
+    def take_pics(self, destfolder = None):
+        if destfolder is None:
+            destfolder = self.destfolder
+        os.makedirs(destfolder, exist_ok=True)
+        wrist_camera_left = urllib.request.urlopen(self.url_left)
+        wrist_camera_right = urllib.request.urlopen(self.url_right)
+        frame_left = cv2.imdecode(np.array(bytearray(wrist_camera_left.read()), dtype=np.uint8), -1)
+        frame_right = cv2.imdecode(np.array(bytearray(wrist_camera_right.read()), dtype=np.uint8), -1)
+        fname_left = str(datetime.datetime.now().timestamp()).split('.')[0] + '_left.png'
+        fname_right = fname_left.replace('left', 'right')
+        path_left = os.path.join(destfolder, fname_left)
+        path_right = os.path.join(destfolder, fname_right)
+        cv2.imwrite(path_left, frame_left)
+        cv2.imwrite(path_right, frame_right)
+
+    def analyze_image(self, destfolder = None, visualize = True):
+        if destfolder is None:
+            destfolder = self.destfolder
+        env_name = r"C:/Users/xyao0/anaconda3/envs/DLC"
+        script_path = "C:/Users/xyao0/Desktop/project/assembly/analyze_images.py"
+        conda_path = "C:/Users/xyao0/anaconda3/ScripDts/conda.exe"
+        subprocess.run(["conda", "run", "-p", env_name, "python", script_path, destfolder, self.imagetype, str(visualize)], shell=True)
+
+    def clear_folder(self, destfolder = None):
+        if destfolder is None:
+            destfolder = self.destfolder
+            # Check if the folder exists
+        if os.path.exists(destfolder) and os.path.isdir(destfolder):
+            for item in os.listdir(destfolder):
+                item_path = os.path.join(destfolder, item)
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.remove(item_path)  # Remove file or symbolic link
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)  # Remove directory
+            print(f"Cleared contents of '{destfolder}'")
+        else:
+            print(f"The folder '{destfolder}' does not exist or is not a directory.")
+
+class Network():
+    def __init__(self, max_len, train_stat, device, n_dims = 7, n_tasks = 3, n_objs = 4, embed_dim = 64, n_head = 8, n_encoder_layers = 3, n_decoder_layers = 3 ):
+        self.traj_seq_dim = n_dims + n_objs + 1
+        self.norm_func = normalize_wrapper(train_stat['mean'], train_stat['std'])
+        self.mean = train_stat['mean']
+        self.std = train_stat['std']
+        self.max_len = max_len
+        self.model = TFEncoderDecoder4(task_dim=n_dims, target_dim= self.traj_seq_dim, source_dim= self.traj_seq_dim,
+                                      n_tasks=n_tasks,
+                                      embed_dim=embed_dim, nhead = n_head, max_len= max_len,
+                                      num_encoder_layers=n_encoder_layers,
+                                      num_decoder_layers=n_decoder_layers, device=device)
+    def load_model(self, model_path):
+        self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+
+    def get_obj_tags(self, all_objs):
+        self.obj_tags = create_tags(all_objs)
+
+    def update_obj_sequence(self, df_pose_zed, df_pose_wrist , tcp_pose, all_objs, task_dims = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw']):
+        '''
+        :param df_pose_zed: Current object pose detected by zed cam
+        :param df_pose_wrist: Current object pose detected by wrist cam
+        :param tcp_pose: Current tcp pose
+        :param task_dims: Dimensions of the task
+        :return:
+        '''
+        obj_pose_seq = []
+        if df_pose_wrist is None:
+            df_pose_wrist = df_pose_zed
+        individuals = list(df_pose_zed.columns)
+        for object_ind in all_objs:
+            if object_ind != 'trajectory': ### Actual object excluding the trajectory object
+                individual = [ind for ind in individuals if object_ind in ind][0]
+                obj_pose_zed = df_pose_zed[individual][task_dims].to_numpy()
+                obj_pose_wrist = df_pose_wrist[individual][task_dims].to_numpy()
+                if not np.isnan(obj_pose_wrist).any():
+                    obj_pose = obj_pose_wrist
+                else:
+                    obj_pose = obj_pose_zed
+            else: ### The trajectory object
+                obj_pose = tcp_pose
+            obj_pose = np.concatenate([obj_pose, self.obj_tags[object_ind]])
+            obj_pose_seq.append(obj_pose)
+        obj_pose_seq = torch.tensor(obj_pose_seq)
+        obj_seq_normalized = self.norm_func(obj_pose_seq.clone())
+        self.obj_seq = obj_seq_normalized[None, :, :]
+        return self.obj_seq
+
+    def predict_traj(self, traj_len):
+        self.model.eval()
+        traj_hidden = torch.zeros((1, self.max_len, self.traj_seq_dim), dtype=torch.double)
+        traj_hidden[0, :, 7] = 1
+        padding_mask = torch.zeros(1, self.max_len)
+        padding_mask[0, traj_len:] = 1
+        padding_mask = padding_mask > 0
+        output_seq, _ = self.model(self.obj_seq, traj_hidden, tgt_padding_mask=padding_mask)
+        self.output_seq = output_seq.detach().numpy()[0]
+        print(self.output_seq.shape, 'ffffff')
+        traj = quat_to_rotvect(self.output_seq)
+        traj[:, :3] = (traj[:, :3] * self.std + self.mean) / SCALE
+        return traj[:traj_len]
+
+    def plot_traj_and_obj_pos(self, traj_pos, obj_data, colors, all_objs):
+        fig = plt.figure(figsize=(9, 5))
+        ax = fig.add_subplot(1, 1, 1, projection='3d')
+        line = ax.plot(traj_pos[:, 0], traj_pos[:, 1], (traj_pos[:, 2]),
+                       color=colors['traj'], label=f'traj')
+        ax.plot(traj_pos[-1, 0], traj_pos[-1, 1], traj_pos[-1, 2], 'x',
+                color=colors['traj'], label=f'end')
+        ax.plot(traj_pos[0, 0], traj_pos[0, 1], traj_pos[0, 2], 'o',
+                color=colors['traj'], label=f'start')
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_zlabel('z')
+        for i in range(len(obj_data)):
+            obj_pos = obj_data[i, :3]
+            unique_obj = all_objs[i]
+            color = colors[unique_obj]
+            ax.plot(obj_pos[0], obj_pos[1], obj_pos[2], 's', color=color)
+        return ax
 
 
-def plot_traj_and_obj_pos(traj_pos, obj_data, colors, all_objs):
-    fig = plt.figure(figsize=(9, 5))
-    ax = fig.add_subplot(1, 1, 1, projection='3d')
-    traj_color = colors['traj']
-    line = ax.plot(traj_pos[:, 0], traj_pos[:, 1], (traj_pos[:, 2]),
-                   color=traj_color, label=f'traj')
-    ax.plot(traj_pos[-1, 0], traj_pos[-1, 1], traj_pos[-1, 2], 'x',
-            color=traj_color, label=f'end')
-    ax.plot(traj_pos[0, 0], traj_pos[0, 1], traj_pos[0, 2], 'o',
-            color=traj_color, label=f'start')
+class PoseProcessor():
+    def __init__(self, transformation_dir, destfolder_zed, destfolder_wrist):
+        with open(os.path.join(transformation_dir, 'zed_in_base.pickle'), 'rb') as f:
+            self.zed_in_base = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'wrist_cam_in_tcp.pickle'), 'rb') as f:
+            self.wrist_camera_in_tcp = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'HT_template_in_base_for_zed.pickle'), 'rb') as f:
+            self.HT_template_in_base_for_zed = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'HT_template_in_base_for_wrist.pickle'), 'rb') as f:
+            self.HT_template_in_base_for_wrist = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'template_in_base_for_zed.pickle'), 'rb') as f:
+            self.obj_templates_in_base_for_zed = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'template_in_base_for_wrist.pickle'), 'rb') as f:
+            self.obj_templates_in_base_for_wrist = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'template_in_obj_for_zed.pickle'), 'rb') as f:
+            self.obj_templates_in_obj_for_zed = pickle.load(f)
+        with open(os.path.join(transformation_dir, 'template_in_obj_for_wrist.pickle'), 'rb') as f:
+            self.obj_templates_in_obj_for_wrist = pickle.load(f)
+        self.destfolder_zed = destfolder_zed
+        self.destfolder_wrist = destfolder_wrist
 
-    for i in range(obj_data.shape[0]):
-        obj_pos = obj_data[i, :3]
-        unique_obj = all_objs[i]
-        color = colors[unique_obj]
-        ax.plot(obj_pos[0], obj_pos[1], obj_pos[2], 's', color=color)
-    plt.show()
-    return
+    def get_pose_zed(self, h5_3d_file = None):
+        if h5_3d_file is None:
+            h5_3d_file = os.path.join(self.destfolder_zed, '3d_combined', 'markers_trajectory_3d.h5')
+        if not os.path.isfile(h5_3d_file):
+            self.obj_pose_zed = None
+        else:
+            self.obj_pose_zed = get_obj_pose(h5_3d_file, self.destfolder_zed, self.zed_in_base, self.obj_templates_in_base_for_zed, self.HT_template_in_base_for_zed, suffix = 'zed',
+                         window_size=5)
 
-def plot_traj_ori(axes, quats):
-    for i, ax in enumerate(axes):
-        ax.plot(quats[:, i], color='red')
-        ax.set_ylim(-np.sqrt(2), np.sqrt(2))
+    def get_pose_wrist(self, current_pose, h5_3d_file = None):
+        if h5_3d_file is None:
+            h5_3d_file = os.path.join(self.destfolder_wrist, '3d_combined', 'markers_trajectory_wrist_3d.h5')
+        if not os.path.isfile(h5_3d_file):
+            self.obj_pose_wrist = None
+        else:
+            pos = np.array(current_pose[:3])
+            rotmatrix = R.from_rotvec(current_pose[3:]).as_matrix()
+            tcp_in_robot = homogeneous_transform(rotmatrix, pos)
+            wrist_cam_in_base = tcp_in_robot @ self.wrist_camera_in_tcp
+            self.obj_pose_wrist = get_obj_pose(h5_3d_file, self.destfolder_wrist, wrist_cam_in_base, self.obj_templates_in_base_for_wrist,
+                                             self.HT_template_in_base_for_wrist, suffix='wrist',
+                                             window_size=1)
 
-def update_object_pose_zed(demo_dir):
-    video_dirs = sorted(os.listdir(os.path.join(demo_dir, 'zed_videos')))
-    if len(video_dirs) != 0:
-        video_dir = video_dirs[-1]
-        df_pose_zed = pd.read_csv(os.path.join(demo_dir, 'zed_videos', video_dir, 'obj_pose_zed.csv'), index_col=0)
-    else:
-        df_pose_zed = None
-    df_pose_wrist = None
-    obj_seq = update_obj_sequence(df_pose_zed, df_pose_wrist, all_objs, task_dims, obj_tags)
-    return obj_seq
+class IBVS():
+    def __init__(self, robot, wrist, max_lmbda = 0.1, thresh = 20, max_run = 3, scale = 1000):
+        self.wrist = wrist
+        self.max_lmbda = max_lmbda
+        self.thersh = thresh
+        self.max_run = max_run
+        self.n_run = 0
+        self.finished = False
+        self.robot = robot
+        self.scale = scale
 
-def update_object_pose_wrist(demo_dir):
-    video_dirs = sorted(os.listdir(os.path.join(demo_dir, 'zed_videos')))
-    if len(video_dirs) != 0:
-        video_dir = video_dirs[-1]
-        df_pose_zed = pd.read_csv(os.path.join(demo_dir, 'zed_videos', video_dir, 'obj_pose_zed.csv'), index_col=0)
-    else:
-        df_pose_zed = None
-    image_dirs = sorted(os.listdir(os.path.join(demo_dir, 'wrist_images')))
-    if len(image_dirs) != 0:
-        image_dir = image_dirs[-1]
-        df_pose_wrist = pd.read_csv(os.path.join(demo_dir, 'wrist_images', image_dir, 'obj_pose_wrist.csv'),
-                                    index_col=0)
-    else:
-        df_pose_wrist = None
-    obj_seq = update_obj_sequence(df_pose_zed, df_pose_wrist, all_objs, task_dims, obj_tags)
-    return obj_seq
+    def process_traj(self):
+        ### Convert tcp poses using wrist camera poses
+        cam_poses_path = 'C:/Users/xyao0/Desktop/project/assembly/data/reproduce/ibvs/plan/cam_poses.pickle'
+        if os.path.isfile(cam_poses_path):
+            with open(cam_poses_path, 'rb') as f:
+                tmp = pickle.load(f)
+            cam_poses = tmp[:-1]
+            is_finished = tmp[-1]
+            with open('C:/Users/xyao0/Desktop/project/assembly/transformations/2024-08-28/wrist_cam_in_tcp.pickle',
+                      'rb') as f:
+                H_cam_in_tcp = pickle.load(f)
+
+            vec_tcp_in_base = np.array(self.robot.get_tcp_pose())
+            H_tcp_in_base = vec2homo(vec_tcp_in_base)
+            H_cam_in_tcp[:-1, -1] /= self.scale
+            H_tcp_in_cam = inverse_homogeneous_transform(H_cam_in_tcp)
+
+            tcp_poses = []
+            tcp_poses_vec = []
+            for cam_pose in cam_poses:
+                tcp_pose = H_tcp_in_base @ H_cam_in_tcp @ cam_pose @ H_tcp_in_cam
+                tcp_poses.append(tcp_pose)
+                tcp_poses_vec.append(homo2vec(tcp_pose))
+            tcp_poses_vec = np.array(tcp_poses_vec)
+            os.remove(cam_poses_path) ### delete the file to avoid repeated movement
+        else:
+            tcp_poses_vec = None ### Return None if camera pose is not found
+            is_finished = False
+        return tcp_poses_vec, is_finished
+
+    def run(self, current_dir, target_dir, individuals):
+        for i in range(self.max_run):
+            if self.finished:
+                print('IBVS finished due to threshold statisfied.')
+                break
+            self.n_run = i
+            if self.n_run < self.max_run:
+                env_name = r"C:/Users/xyao0/anaconda3/envs/rvc3"
+                script_path = "C:/Users/xyao0/Desktop/project/rvc/ibvs_stereo.py"
+                lmbda = self.max_lmbda * 1 / (self.max_run - self.n_run)
+                args = [current_dir, target_dir, str(individuals), f'{lmbda}', str(self.thersh)]
+                subprocess.run(["conda", "run", "-p", env_name, "python", script_path] + args, shell=True)
+
+                ### Handel projectory ###
+                planned_traj, is_finished = self.process_traj()
+                # print(is_finished)
+                # self.finished = is_finished
+                # fig = plt.figure(figsize=(9, 5))
+                # ax = fig.add_subplot(1, 1, 1, projection='3d')
+                # ax.plot(planned_traj[0, 0], planned_traj[0, 1], planned_traj[0, 2], 'o', color = 'red')
+                # ax.plot(0, 0, 0, 'o', color = 'blue')
+                # ax.plot(planned_traj[:,0], planned_traj[:,1], planned_traj[:,2])
+                # ax.set_xlabel('x')
+                # ax.set_ylabel('y')
+                # ax.set_zlabel('z')
+                # plt.show()
+                # raise
+                ### Move robot ###
+                self.robot.servoL(planned_traj)
+
+                ### Take pics ###
+                if self.n_run < self.max_run - 1:
+                    self.wrist.clear_folder()
+                    self.wrist.take_pics()
+                    self.wrist.analyze_image()
+
+        print('IBVS finished due to max runs')
 
 
+class Planner():
+    def __init__(self, net, robot, zed, wrist, pose_processor, action_summary, all_objs):
+        self.net = net
+        self.robot = robot
+        self.zed = zed
+        self.wrist = wrist
+        self.wrist_start_inds = action_summary['median_wrist_inds']
+        self.wrist_end_inds = action_summary['wrist_end_inds']
+        self.median_len = action_summary['median_traj_len']
+        self.pose_processor = pose_processor
+        self.curret_ind = 0
+        self.all_objs = all_objs
 
-def predict_traj_and_action(new_model, obj_seq, traj_seq):
-    obj_seq_normalized = norm_func(obj_seq.clone())
-    obj_seq_normalized = obj_seq_normalized[None, :, :]
-    obj_seq_normalized = obj_seq_normalized.to(device)
-    traj_seq = traj_seq.to(device)
-    predicted_traj_tf, actin_tag_pred = new_model(obj_seq_normalized, traj_seq)
-    predicted_traj = predicted_traj_tf.cpu().detach().numpy()[0]
-    predicted_traj[:, :3] = predicted_traj[:, :3] * train_std + train_mean
-    actin_tag_pred = actin_tag_pred.cpu().detach().numpy()[0]
-    return predicted_traj, np.argmax(actin_tag_pred)
+    def step(self, current_ind = None):
+        current_tcp_in_base = np.array(robot.get_tcp_pose())
+        current_tcp_in_base[:3] = current_tcp_in_base[:3] * SCALE
+        current_tcp_in_base_quat = rotvect_to_quat(current_tcp_in_base).flatten()
+        if current_ind is None:
+            current_ind = self.curret_ind
 
-def quat_to_rotvec(traj):
-    traj_new = np.zeros((len(traj), 6))
-    traj_new[:, :3] = traj[:, :3]
-    traj_new[:, 3:] = R.from_quat(traj[:, 3:]).as_rotvec()
-    return traj_new
+        if current_ind in self.wrist_start_inds: ### Do IBVS ###
+            pass
+        else:### Use transformer
+            if current_ind == 0:
+                # self.zed.clear_folder()
+                # self.zed.capture_video()
+                # self.zed.analyze_video()
+                self.pose_processor.get_pose_zed()
+                self.net.update_obj_sequence(self.pose_processor.obj_pose_zed, None, current_tcp_in_base_quat, self.all_objs)
+                traj = self.net.predict_traj(self.median_len)
+                print(traj.shape)
+                raise
+            else:
+            #     self.wrist.clear_folder()
+            #     self.wrist.take_pics()
+            #     self.wrist.analyze_image()
+                self.pose_processor.get_pose_wrist()
 
+            ### Do transformer ###
 
 if __name__ == "__main__":
+    SCALE = 1000
+    ### Load task config ###
+    project_dir = 'C:/Users/xyao0/Desktop/project/assembly'
+    with open(os.path.join(project_dir, 'data/task_config.yaml')) as file:
+        config = yaml.load(file, Loader=yaml.FullLoader)
     ### Create dirs to reproduce
     DATE = str(datetime.date.today())
-    DATE = '2024-05-28'
-    FOLDER = os.path.join('C:/Users/xyao0/Desktop/project/assembly/data/reproduce', DATE)
+    FOLDER = os.path.join(project_dir, 'data/reproduce')
     if not os.path.isdir(FOLDER):
         os.makedirs(FOLDER, exist_ok=True)
 
     ### Load transformer data
-    assembly_dir = 'C:/Users/xyao0/Desktop/project/assembly'
+    max_len = 200
+    objs = sorted(config['objects'])
+    all_objs = objs + ['trajectory']
+    actions = config['actions']
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    max_len = 170
-    task_config = 'C:/Users/xyao0/Desktop/project/assembly/data/task_config.yaml'
-    with open(task_config) as file:
-        config = yaml.load(file, Loader=yaml.FullLoader)
-    project_dir = config['project_path']  # Modify this to your need.
-    # with open(os.path.join(project_dir, 'data', 'processed', 'wrist_cam_ind.pickle'), 'rb') as f:
-    #     wrist_cam_ind = pickle.load(f)
-
-    wrist_cam_ind = {'action_0': 18, 'action_1': 14, 'action_2': 15}
-    grasp_inds = {'action_0': 78, 'action_1': 75, 'action_2':76}
-    open_inds = {'action_0': 134, 'action_1': 134, 'action_2':-1}
-
-    all_objs = config['objects']
-    colors = {'bolt': 'green', 'nut': 'yellow', 'bin': 'black', 'jig': 'purple', 'traj': 'red'}
-    task_dims = ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw']
-    # instaniate all object type and enable/disable via-points
-    unique_objs = ['trajectory'] + sorted(list(set(all_objs)))
-    obj_tags = create_tags(unique_objs)
-    with open(os.path.join(assembly_dir, 'transformer', 'train_stat.pickle'), 'rb') as f:
+    print("Cuda available: ", torch.cuda.is_available())
+    model_folder = 'speed_grasp_weights-hidden-64-smooth_pos'
+    model_ind = 50000
+    seed = 123
+    model_path = f'C:/Users/xyao0/Desktop/project/assembly/transformer/{model_folder}/{seed}/model_{model_ind}.pth'
+    model_stat_path = f'C:/Users/xyao0/Desktop/project/assembly/transformer/{model_folder}/{seed}/train_stat.pickle'
+    with open(model_stat_path, 'rb') as f:
         train_stat = pickle.load(f)
-    train_mean = train_stat['mean']
-    train_std = train_stat['std']
-    norm_func = normalize_wrapper(train_mean, train_std)
-    n_dims = len(task_dims)
-    n_objs = len(unique_objs)
-    task_dim = n_dims + n_objs
-    traj_seq = torch.zeros((1, max_len, task_dim), dtype = torch.double)
-    traj_seq[0, :, n_dims:] = obj_tags['trajectory']
-    n_encoder_layers = 3
-    n_decoder_layers = 3
-    n_tasks = 3
-    ### Wrist model
-    new_model = TFEncoderDecoder2(task_dim=task_dim, traj_dim=n_dims, n_tasks=n_tasks, n_objs=n_objs - 1,
-                                  embed_dim=32, nhead=8, max_len=max_len, num_encoder_layers=n_encoder_layers,
-                                  num_decoder_layers=n_decoder_layers, device=device)
-
-    model_ind = 5000
-    date = '05_01_2024'
-    PATH = os.path.join(assembly_dir, 'transformer', date, f'model_{model_ind}_action.pth')
-    new_model.load_state_dict(torch.load(PATH,  map_location=torch.device(device)))
-    new_model.eval()
-    ### Zed model
-    new_model_zed = TFEncoderDecoder2(task_dim=task_dim, traj_dim=n_dims, n_tasks=n_tasks, n_objs=n_objs - 1,
-                                  embed_dim=32, nhead=8, max_len=max_len, num_encoder_layers=n_encoder_layers,
-                                  num_decoder_layers=n_decoder_layers, device=device)
-
-    model_ind = 4005
-    date = '2024-05-28'
-    PATH = os.path.join(assembly_dir, 'transformer', date, f'model_{model_ind}_action.pth')
-    new_model_zed.load_state_dict(torch.load(PATH, map_location=torch.device(device)))
-    new_model_zed.eval()
-
-
-    ### Load transformations
-    with open(os.path.join(project_dir, 'transformations', 'zed_in_base.pickle'), 'rb') as f:
-        zed_in_base = pickle.load(f)
-    with open(os.path.join(project_dir, 'transformations', 'wrist_cam_in_tcp.pickle'), 'rb') as f:
-        wrist_camera_in_tcp = pickle.load(f)
-    with open(os.path.join(project_dir, 'transformations', 'HT_template_in_base_for_zed.pickle'), 'rb') as f:
-        HT_template_in_base_for_zed = pickle.load(f)
-    with open(os.path.join(project_dir, 'transformations', 'HT_template_in_base_for_wrist.pickle'), 'rb') as f:
-        HT_template_in_base_for_wrist = pickle.load(f)
-    with open(os.path.join(project_dir, 'transformations', 'template_in_base_for_zed.pickle'), 'rb') as f:
-        obj_templates_in_base_for_zed = pickle.load(f)
-    with open(os.path.join(project_dir, 'transformations', 'template_in_base_for_wrist.pickle'), 'rb') as f:
-        obj_templates_in_base_for_wrist = pickle.load(f)
+    my_net = Network(max_len, train_stat, device)
+    my_net.load_model(model_path)
+    my_net.get_obj_tags(all_objs)
 
     ### Connect to the robot #######
     FREQUENCY = 1
     dt = 1/ FREQUENCY
-
-    scale = 1000
     host = "192.168.3.5"
-    rtde, rtde_c, rtde_r = connect_robot(host, FREQUENCY)
+    robot = Robot(host, FREQUENCY)
+    # robot.connect()
 
-    ### The TCP offset when collecting data###
-    # tmp = rtde_c.getTCPOffset()
-    # tcp_offset = [0.0, 0.0, 0.18659, 0.0, 0.0, -3.141590000011358]
+    ### Connect to the zed camera ###
+    destfolder_zed = os.path.join(FOLDER, 'zed')
+    zed_cam = Zed(destfolder_zed)
+    # zed_cam.connect_camera()
+    # zed_cam.capture_video()
+    # zed_cam.analyze_video()
 
-    # rtde_c.setTcp([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
-    ### Connect to the camera ###
-    # my_camera = connect_camera()
+    ### Connect to the writst cameras ###
+    url_left = 'http://192.168.0.102:8080/shot.jpg'
+    url_right = 'http://192.168.0.101:8080/shot.jpg'
+    destfolder_wrist = destfolder_zed.replace('zed', 'wrist')
+    wrist_cam = Wrist(destfolder_wrist, url_left, url_right)
+    # wrist_cam.take_pics()
+    # wrist_cam.analyze_image()
 
-    ### Connect to the writst camera
-    url = 'http://192.168.37.19:8080/video'
-    connect_wrist_camera(url)
+    ### Object pose processor ###
+    transformation_dir = config['transformation_path']
+    pose_processor = PoseProcessor(transformation_dir, destfolder_zed, destfolder_wrist)
+    # pose_processor.get_pose_zed()
+
+    action = 'action_0'
+    action_summary_file = os.path.join(project_dir, 'data', 'processed', action, 'action_summary.pickle')
+    with open(action_summary_file, 'rb') as f:
+        action_summary = pickle.load(f)
+    median_traj_len = action_summary['median_traj_len']
+    vs_start_inds = action_summary['median_wrist_inds']
+    action_summary['wrist_end_inds'] = [81, 104, 144]
+
+    my_planner = Planner(my_net, robot, zed_cam, wrist_cam, pose_processor, action_summary, all_objs)
+    my_planner.step()
+    raise
+
+    action = 'action_0'
+    action_summary_file = os.path.join(project_dir, 'data', 'processed', action, 'action_summary.pickle')
+    with open(action_summary_file, 'rb') as f:
+        action_summary = pickle.load(f)
+    median_traj_len = action_summary['median_traj_len']
+    vs_start_inds = action_summary['median_wrist_inds']
+    vs_end_inds = [81, 104, 144]
+    gripper_close_ind = 81
+    gripper_open_ind = 144
+
+    current_ind = 0
+    for i, ind in enumerate(vs_start_inds):
+        # ### Predict from transformer
+        # current_tcp_in_base = np.array(robot.get_tcp_pose())
+        # print(current_tcp_in_base)
+        # current_tcp_in_base[:3] = current_tcp_in_base[:3] * SCALE
+        # pose_processor.get_pose_wrist(h5_3d_file_wrist, current_tcp_in_base, destfolder_wrist)
+        # current_tcp_in_base_quat = rotvect_to_quat(current_tcp_in_base).flatten()
+        # my_net.udpate_obj_sequence(pose_processor.obj_pose_zed, pose_processor.obj_pose_wrist, current_tcp_in_base_quat,
+        #                            all_objs)
+        # output_seq = my_net.predict_traj(median_traj_len, current_tcp_in_base_quat).detach().numpy()[0]
+        # traj = quat_to_rotvect(output_seq[current_ind:ind])
+        # traj[:, :3] = (traj[:, :3] * train_stat['std'] + train_stat['mean']) / SCALE
+        # robot.servoL(traj)
+
+        ### Take wrist images
+        # time.sleep(5)
+        # wrist_cam.take_pics()
+        # wrist_cam.analyze_image()
+        ibvs = IBVS(robot, wrist_cam)
+        target_dir = os.path.join(project_dir, 'data', 'reproduce', 'ibvs', action)
+        ibvs.run(destfolder_wrist, target_dir, ['nut1'])
+        raise
+
+
+
+    # colors =  {'bolt': 'green', 'nut':'yellow', 'bin':'black', 'jig':'purple', 'traj':'red', 'trajectory': 'pink'}
+    # my_net.plot_traj_and_obj_pos(my_net.output_seq.detach().numpy()[0], my_net.obj_seq.detach().numpy()[0], colors, all_objs)
+    # plt.show()
+    # print(output_seq.shape)
+    # raise
+    ### Prodict trajectory using Transformer
+
 
     ##### Set up pygame screen ##############
     n_trial = 0
